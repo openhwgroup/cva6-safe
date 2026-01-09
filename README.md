@@ -3,6 +3,6 @@ A dual-core lockstep (DCLS) subsystem for the CVA6.  Also supports dual-core asy
 The hardening of cache memories against single event upsets (SEU) is also included.
 Expect source code publication in 1Q2026.
 
-# Acknowledgement
+## Acknowledgement
 Some Thales contributions to this work are supported by the NeuroSoC project,
 which has received funding from the European Union under Horizon Europe grant agreement no 101070634.
