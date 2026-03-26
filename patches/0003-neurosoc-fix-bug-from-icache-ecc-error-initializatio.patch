@@ -1,0 +1,115 @@
+From 8fe0d634be772c920fdb6253424cbef9b81599fe Mon Sep 17 00:00:00 2001
+From: Abdou Lahat NDIAYE <abdou-lahat.ndiaye@thalesgroup.com>
+Date: Tue, 10 Feb 2026 17:52:27 +0100
+Subject: [PATCH 3/3] [neurosoc] fix bug from icache ecc error initialization
+
+---
+ core/neurosoc/neurosoc_cache_pkg.sv      |  9 ++++-----
+ core/neurosoc/neurosoc_cache_sram_ext.sv | 21 ++++++++++++++-------
+ 2 files changed, 18 insertions(+), 12 deletions(-)
+
+diff --git a/core/neurosoc/neurosoc_cache_pkg.sv b/core/neurosoc/neurosoc_cache_pkg.sv
+index ae4cd9b8..3497c61c 100644
+--- a/core/neurosoc/neurosoc_cache_pkg.sv
++++ b/core/neurosoc/neurosoc_cache_pkg.sv
+@@ -53,6 +53,10 @@ package neurosoc_cache_pkg;
+ 
+   // Cache Instruction
+ 
++  localparam ICACHE_OFFSET_WIDTH = $clog2(CVA6Cfg.ICACHE_LINE_WIDTH / 8);
++  localparam ICACHE_NUM_WORDS = 2 ** (CVA6Cfg.ICACHE_INDEX_WIDTH - ICACHE_OFFSET_WIDTH);
++  localparam ICACHE_CL_IDX_WIDTH = $clog2(ICACHE_NUM_WORDS);
++  
+   typedef struct packed {
+     logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0]       data_req;
+     logic                                      data_we;
+@@ -74,11 +78,6 @@ package neurosoc_cache_pkg;
+     logic                                                            ecc_error;
+   } icache_ext_resp_t;
+ 
+-
+-  localparam ICACHE_OFFSET_WIDTH = $clog2(CVA6Cfg.ICACHE_LINE_WIDTH / 8);
+-  localparam ICACHE_NUM_WORDS = 2 ** (CVA6Cfg.ICACHE_INDEX_WIDTH - ICACHE_OFFSET_WIDTH);
+-  localparam ICACHE_CL_IDX_WIDTH = $clog2(ICACHE_NUM_WORDS);
+-
+   // ECC 
+   function integer calculate_parity_size;
+     input integer k;
+diff --git a/core/neurosoc/neurosoc_cache_sram_ext.sv b/core/neurosoc/neurosoc_cache_sram_ext.sv
+index 7765516c..6ee564ce 100644
+--- a/core/neurosoc/neurosoc_cache_sram_ext.sv
++++ b/core/neurosoc/neurosoc_cache_sram_ext.sv
+@@ -1,5 +1,5 @@
+ // Copyright (c) 2023 - 2025 Thales
+-// All Rights Reserved. 
++// All Rights Reserved.
+ //
+ // Author: Abdou Lahat NDIAYE, Thales cortAIx Labs
+ // Date: 29.01.2025
+@@ -21,7 +21,7 @@ module neurosoc_cache_sram_ext
+ ) (
+     input logic clk_i,
+     input logic rst_ni,
+-
++    input logic dcache_ecc_error_i,
+     input  dcache_ext_req_t  dcache_req,
+     output dcache_ext_resp_t dcache_resp,
+     input  icache_ext_req_t  icache_req,
+@@ -29,6 +29,7 @@ module neurosoc_cache_sram_ext
+ );
+ 
+ //DATA CACHE
++  assign dcache_resp.ecc_error = dcache_ecc_error_i;
+ 
+   for (genvar k = 0; k < DCACHE_NUM_BANKS; k++) begin : gen_data_banks
+     // Data RAM
+@@ -54,7 +55,7 @@ module neurosoc_cache_sram_ext
+   logic [CVA6Cfg.DCACHE_SET_ASSOC*DCACHE_TAG_SRAM_WIDTH -1 :0] dcache_data_sram_wdata;
+   logic [CVA6Cfg.DCACHE_SET_ASSOC*DCACHE_TAG_SRAM_WIDTH -1 :0] dcache_data_sram_rdata;
+   logic [CVA6Cfg.DCACHE_SET_ASSOC*BE_DCACHE_TAG_WIDTH-1 : 0] dcache_data_sram_be;
+-  
++
+   // Linearization
+   for (genvar i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin : gen_sram_dcache_concat
+     assign dcache_data_sram_wdata[i*DCACHE_TAG_SRAM_WIDTH +:DCACHE_TAG_SRAM_WIDTH ] = {
+@@ -105,6 +106,8 @@ module neurosoc_cache_sram_ext
+   logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] db_err_tag;
+   logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] sb_err_data;
+   logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] db_err_data;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] tmp_sb_err_data;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] tmp_db_err_data;
+ 
+   for (genvar i = 0; i < CVA6Cfg.ICACHE_SET_ASSOC; i++) begin : gen_ecc
+     assign icache_tag_wdata_enc[i][ICACHE_TAG_SRAM_WIDTH-1:ICACHE_TAG_WIDTH_NEW] = '0;
+@@ -167,10 +170,14 @@ module neurosoc_cache_sram_ext
+         .q_err_o(icache_resp.data_rdata[i]),  //information bit vector output
+         .syndrome_o(),  //syndrome vector output
+         //flags
+-        .sb_err_o(sb_err_data[i]),  //single bit error detected
+-        .db_err_o(db_err_data[i]),  //double bit error detected
++        .sb_err_o(tmp_sb_err_data[i]),  //single bit error detected
++        .db_err_o(tmp_db_err_data[i]),  //double bit error detected
+         .sb_fix_o()  //repaired error in the information bits
+       );
++      
++      //PZ mask the single bit and double bit error on data in case tag is not valid...
++      assign sb_err_data[i] = tmp_sb_err_data[i] && icache_resp.tag_rdata[i][CVA6Cfg.ICACHE_TAG_WIDTH];
++      assign db_err_data[i] = tmp_db_err_data[i] && icache_resp.tag_rdata[i][CVA6Cfg.ICACHE_TAG_WIDTH];
+ 
+     end else begin
+       assign icache_tag_wdata_enc[i][ICACHE_TAG_WIDTH_NEW-1 : 0] = icache_req.tag_wdata[i];
+@@ -198,9 +205,9 @@ module neurosoc_cache_sram_ext
+   assign icache_data_wdata_enc[ICACHE_DATA_SRAM_WIDTH-1:ICACHE_DATA_WIDTH_NEW] = '0;
+ 
+ 
+-  assign icache_resp.ecc_error = (neurosoc_cache_pkg::ECC_EN) ? |sb_err_tag | |db_err_tag |sb_err_data | |db_err_data : 1'b0;
++  assign icache_resp.ecc_error = (neurosoc_cache_pkg::ECC_EN) ? (|sb_err_tag) | (|db_err_tag) | (|sb_err_data) | (|db_err_data) : 1'b0;
+ 
+-  // Linearization of memory signals 
++  // Linearization of memory signals
+   for (genvar i = 0; i < CVA6Cfg.ICACHE_SET_ASSOC; i++) begin : gen_sram_concat
+ 
+     assign icache_tag_sram_wdata[i*(ICACHE_TAG_SRAM_WIDTH) +: (ICACHE_TAG_SRAM_WIDTH)] = icache_tag_wdata_enc[i];
+-- 
+2.50.1
+

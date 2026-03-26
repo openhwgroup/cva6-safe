@@ -1,0 +1,12 @@
+.Xil
+generated
+mode_*.mif
+neurosoc.cache
+neurosoc.hw
+neurosoc.xpr
+reports
+vivado.jou
+vivado_*.backup.jou
+vivado.log
+vivado_*.backup.log
+work-fpga

@@ -1,0 +1,1500 @@
+From 913e3e1965f11c88336944bc9eb523a8e5f9242b Mon Sep 17 00:00:00 2001
+From: Abdou Lahat NDIAYE <abdou-lahat.ndiaye@thalesgroup.com>
+Date: Mon, 3 Feb 2025 10:18:51 +0100
+Subject: [PATCH 1/3] [neurosoc] moving sram instances out of the core, adding
+ double error correction on the icache mem
+
+---
+ core/Flist.cva6                            |   6 +
+ core/cache_subsystem/cva6_icache.sv        | 103 +++----
+ core/cache_subsystem/wt_cache_subsystem.sv |  22 +-
+ core/cache_subsystem/wt_dcache.sv          |  16 +-
+ core/cache_subsystem/wt_dcache_mem.sv      |  86 ++----
+ core/cva6.sv                               |  16 +-
+ core/neurosoc/ecc_dec.sv                   | 319 +++++++++++++++++++++
+ core/neurosoc/ecc_enc.sv                   | 217 ++++++++++++++
+ core/neurosoc/neurosoc_cache_pkg.sv        | 112 ++++++++
+ core/neurosoc/neurosoc_cache_sram_ext.sv   | 254 ++++++++++++++++
+ corev_apu/src/ariane.sv                    |  20 +-
+ 11 files changed, 1051 insertions(+), 120 deletions(-)
+ create mode 100644 core/neurosoc/ecc_dec.sv
+ create mode 100644 core/neurosoc/ecc_enc.sv
+ create mode 100644 core/neurosoc/neurosoc_cache_pkg.sv
+ create mode 100644 core/neurosoc/neurosoc_cache_sram_ext.sv
+
+diff --git a/core/Flist.cva6 b/core/Flist.cva6
+index 83d24793..bdf222e4 100644
+--- a/core/Flist.cva6
++++ b/core/Flist.cva6
+@@ -69,6 +69,7 @@ ${CVA6_REPO_DIR}/core/include/wt_cache_pkg.sv
+ ${CVA6_REPO_DIR}/core/include/std_cache_pkg.sv
+ ${CVA6_REPO_DIR}/core/include/instr_tracer_pkg.sv
+ ${CVA6_REPO_DIR}/core/include/build_config_pkg.sv
++${CVA6_REPO_DIR}/core/neurosoc/neurosoc_cache_pkg.sv
+ 
+ //CVXIF
+ ${CVA6_REPO_DIR}/core/include/cvxif_pkg.sv
+@@ -142,6 +143,11 @@ ${CVA6_REPO_DIR}/core/frontend/instr_scan.sv
+ ${CVA6_REPO_DIR}/core/frontend/instr_queue.sv
+ ${CVA6_REPO_DIR}/core/frontend/frontend.sv
+ 
++// neurosoc
++${CVA6_REPO_DIR}/core/neurosoc/ecc_enc.sv
++${CVA6_REPO_DIR}/core/neurosoc/ecc_dec.sv
++${CVA6_REPO_DIR}/core/neurosoc/neurosoc_cache_sram_ext.sv
++
+ // Cache subsystem
+ ${CVA6_REPO_DIR}/core/cache_subsystem/wt_dcache_ctrl.sv
+ ${CVA6_REPO_DIR}/core/cache_subsystem/wt_dcache_mem.sv
+diff --git a/core/cache_subsystem/cva6_icache.sv b/core/cache_subsystem/cva6_icache.sv
+index d649473f..14171fd5 100644
+--- a/core/cache_subsystem/cva6_icache.sv
++++ b/core/cache_subsystem/cva6_icache.sv
+@@ -28,6 +28,7 @@
+ module cva6_icache
+   import ariane_pkg::*;
+   import wt_cache_pkg::*;
++  import neurosoc_cache_pkg::*;
+ #(
+     parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
+     parameter type icache_areq_t = logic,
+@@ -59,7 +60,11 @@ module cva6_icache
+     input  icache_rtrn_t mem_rtrn_i,
+     output logic         mem_data_req_o,
+     input  logic         mem_data_ack_i,
+-    output icache_req_t  mem_data_o
++    output icache_req_t  mem_data_o,
++
++    // sram icache extern ports
++    output icache_ext_req_t  icache_req,
++    input  icache_ext_resp_t icache_resp
+ );
+ 
+   localparam ICACHE_OFFSET_WIDTH = $clog2(CVA6Cfg.ICACHE_LINE_WIDTH / 8);
+@@ -107,9 +112,9 @@ module cva6_icache
+   logic [     ICACHE_CL_IDX_WIDTH-1:0] cl_index;  // this is a cache-line index, to memory array
+   logic [ICACHE_OFFSET_WIDTH-1:0] cl_offset_d, cl_offset_q;  // offset in cache line
+   logic [CVA6Cfg.ICACHE_TAG_WIDTH-1:0] cl_tag_d, cl_tag_q;  // this is the cache tag
+-  logic [CVA6Cfg.ICACHE_TAG_WIDTH-1:0]          cl_tag_rdata [CVA6Cfg.ICACHE_SET_ASSOC-1:0]; // these are the tags coming from the tagmem
+-  logic [CVA6Cfg.ICACHE_LINE_WIDTH-1:0]         cl_rdata     [CVA6Cfg.ICACHE_SET_ASSOC-1:0]; // these are the cachelines coming from the cache
+-  logic [CVA6Cfg.ICACHE_USER_LINE_WIDTH-1:0]    cl_ruser[CVA6Cfg.ICACHE_SET_ASSOC-1:0]; // these are the cachelines coming from the user cache
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_TAG_WIDTH-1:0] cl_tag_rdata; // these are the tags coming from the tagmem
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_LINE_WIDTH-1:0] cl_rdata; // these are the cachelines coming from the cache
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_USER_LINE_WIDTH-1:0] cl_ruser; // these are the cachelines coming from the user cache
+   logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.FETCH_WIDTH-1:0] cl_sel;  // selected word from each cacheline
+   logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.FETCH_USER_WIDTH-1:0] cl_user;  // selected word from each cacheline
+   logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] vld_req;  // bit enable for valid regs
+@@ -118,6 +123,11 @@ module cva6_icache
+   logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] vld_rdata;  // valid bits coming from valid regs
+   logic [ICACHE_CL_IDX_WIDTH-1:0] vld_addr;  // valid bit
+ 
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_TAG_WIDTH:0] cl_tag_valid_rdata;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_TAG_WIDTH:0] cl_tag_wdata;
++
++  logic ecc_err, ecc_err_q, inv_all_ways_ecc_err;
++
+   // cpmtroller FSM
+   typedef enum logic [2:0] {
+     FLUSH,
+@@ -129,6 +139,25 @@ module cva6_icache
+   } state_e;
+   state_e state_d, state_q;
+ 
++  ///////////////////////////////////////////////////////
++  // connexion to sram extern arrays
++  ///////////////////////////////////////////////////////
++
++  assign icache_req.data_req = cl_req;
++  assign icache_req.data_we = cl_we;
++  assign icache_req.data_idx = cl_index;
++  assign icache_req.data_wuser = mem_rtrn_i.user;
++  assign icache_req.data_wdata = mem_rtrn_i.data;
++  assign cl_ruser = icache_resp.data_ruser;
++  assign cl_rdata = icache_resp.data_rdata;
++
++  assign icache_req.tag_req = vld_req;
++  assign icache_req.tag_we = vld_we;
++  assign icache_req.tag_idx = vld_addr;
++  assign icache_req.tag_wdata = cl_tag_wdata;
++  assign cl_tag_valid_rdata = icache_resp.tag_rdata;
++  assign ecc_err = icache_resp.ecc_error;
++
+   ///////////////////////////////////////////////////////
+   // address -> cl_index mapping, interface plumbing
+   ///////////////////////////////////////////////////////
+@@ -208,6 +237,8 @@ module cva6_icache
+     // performance counter
+     miss_o = 1'b0;
+ 
++    inv_all_ways_ecc_err = 1'b0;
++
+     // handle invalidations unconditionally
+     // note: invald are mutually exclusive with
+     // ifills, since both arrive over the same IF
+@@ -271,8 +302,18 @@ module cva6_icache
+           // check if we have to flush
+           if (flush_d) begin
+             state_d = IDLE;
++          end else if (ecc_err && ~dreq_i.kill_s2) begin
++            cmp_en_d = 1'b0;
++            // only count this as a miss if the cache is enabled, and
++            // the address is cacheable
++            // send out ifill request
++            mem_data_req_o = 1'b1;
++            if (mem_data_ack_i) begin
++              inv_all_ways_ecc_err = 1'b1;
++              state_d = MISS;
++            end
+             // we have a hit or an exception output valid result
+-          end else if (((|cl_hit && cache_en_q) || areq_i.fetch_exception.valid) && !inv_q) begin
++          end else if (((|cl_hit && cache_en_q) || areq_i.fetch_exception.valid) && !inv_q && !ecc_err_q) begin
+             dreq_o.valid = ~dreq_i.kill_s2;  // just don't output in this case
+             state_d      = IDLE;
+ 
+@@ -374,7 +415,8 @@ module cva6_icache
+                     (inv_en)         ? mem_rtrn_i.inv.idx[CVA6Cfg.ICACHE_INDEX_WIDTH-1:ICACHE_OFFSET_WIDTH] :
+                                        cl_index;
+ 
+-  assign vld_req  = (flush_en || cache_rden)        ? '1                                    :
++  assign vld_req  = (inv_all_ways_ecc_err)          ? '1                                    :
++                    (flush_en || cache_rden)        ? '1                                    :
+                     (mem_rtrn_i.inv.all && inv_en)  ? '1                                    :
+                     (mem_rtrn_i.inv.vld && inv_en)  ? icache_way_bin2oh(
+       mem_rtrn_i.inv.way
+@@ -382,7 +424,7 @@ module cva6_icache
+ 
+   assign vld_wdata = (cache_wren) ? '1 : '0;
+ 
+-  assign vld_we = (cache_wren | inv_en | flush_en);
++  assign vld_we = (cache_wren | inv_en | flush_en | ecc_err);
+   // assign vld_req   = (vld_we | cache_rden);
+ 
+ 
+@@ -452,54 +494,12 @@ module cva6_icache
+   // memory arrays and regs
+   ///////////////////////////////////////////////////////
+ 
+-
+-  logic [CVA6Cfg.ICACHE_TAG_WIDTH:0] cl_tag_valid_rdata[CVA6Cfg.ICACHE_SET_ASSOC-1:0];
+-
+   for (genvar i = 0; i < CVA6Cfg.ICACHE_SET_ASSOC; i++) begin : gen_sram
+-    // Tag RAM
+-    sram #(
+-        // tag + valid bit
+-        .DATA_WIDTH(CVA6Cfg.ICACHE_TAG_WIDTH + 1),
+-        .NUM_WORDS (ICACHE_NUM_WORDS)
+-    ) tag_sram (
+-        .clk_i  (clk_i),
+-        .rst_ni (rst_ni),
+-        .req_i  (vld_req[i]),
+-        .we_i   (vld_we),
+-        .addr_i (vld_addr),
+-        // we can always use the saved tag here since it takes a
+-        // couple of cycle until we write to the cache upon a miss
+-        .wuser_i('0),
+-        .wdata_i({vld_wdata[i], cl_tag_q}),
+-        .be_i   ('1),
+-        .ruser_o(),
+-        .rdata_o(cl_tag_valid_rdata[i])
+-    );
+-
++    assign cl_tag_wdata[i] = {vld_wdata[i], cl_tag_q};
+     assign cl_tag_rdata[i] = cl_tag_valid_rdata[i][CVA6Cfg.ICACHE_TAG_WIDTH-1:0];
+     assign vld_rdata[i]    = cl_tag_valid_rdata[i][CVA6Cfg.ICACHE_TAG_WIDTH];
+-
+-    // Data RAM
+-    sram #(
+-        .USER_WIDTH(CVA6Cfg.ICACHE_USER_LINE_WIDTH),
+-        .DATA_WIDTH(CVA6Cfg.ICACHE_LINE_WIDTH),
+-        .USER_EN   (CVA6Cfg.FETCH_USER_EN),
+-        .NUM_WORDS (ICACHE_NUM_WORDS)
+-    ) data_sram (
+-        .clk_i  (clk_i),
+-        .rst_ni (rst_ni),
+-        .req_i  (cl_req[i]),
+-        .we_i   (cl_we),
+-        .addr_i (cl_index),
+-        .wuser_i(mem_rtrn_i.user),
+-        .wdata_i(mem_rtrn_i.data),
+-        .be_i   ('1),
+-        .ruser_o(cl_ruser[i]),
+-        .rdata_o(cl_rdata[i])
+-    );
+   end
+ 
+-
+   always_ff @(posedge clk_i or negedge rst_ni) begin : p_regs
+     if (!rst_ni) begin
+       cl_tag_q      <= '0;
+@@ -512,6 +512,7 @@ module cva6_icache
+       cl_offset_q   <= '0;
+       repl_way_oh_q <= '0;
+       inv_q         <= '0;
++      ecc_err_q     <= '0;
+     end else begin
+       cl_tag_q      <= cl_tag_d;
+       flush_cnt_q   <= flush_cnt_d;
+@@ -523,13 +524,13 @@ module cva6_icache
+       cl_offset_q   <= cl_offset_d;
+       repl_way_oh_q <= repl_way_oh_d;
+       inv_q         <= inv_d;
++      ecc_err_q     <= ecc_err;
+     end
+   end
+ 
+   ///////////////////////////////////////////////////////
+   // assertions
+   ///////////////////////////////////////////////////////
+-
+   //pragma translate_off
+ `ifndef VERILATOR
+   repl_inval0 :
+diff --git a/core/cache_subsystem/wt_cache_subsystem.sv b/core/cache_subsystem/wt_cache_subsystem.sv
+index b8e079ed..0087c87a 100644
+--- a/core/cache_subsystem/wt_cache_subsystem.sv
++++ b/core/cache_subsystem/wt_cache_subsystem.sv
+@@ -22,6 +22,8 @@
+ module wt_cache_subsystem
+   import ariane_pkg::*;
+   import wt_cache_pkg::*;
++  import neurosoc_cache_pkg::*;
++
+ #(
+     parameter config_pkg::cva6_cfg_t CVA6Cfg        = config_pkg::cva6_cfg_empty,
+     parameter type                   icache_areq_t  = logic,
+@@ -71,9 +73,15 @@ module wt_cache_subsystem
+     // Invalidations
+     input logic [63:0] inval_addr_i,
+     input logic inval_valid_i,
+-    output logic inval_ready_o
++    output logic inval_ready_o,
+     // TODO: interrupt interface
+-);
++
++    // sram macroports
++    output dcache_ext_req_t dcache_req,
++    input  dcache_ext_resp_t dcache_resp,
++    output icache_ext_req_t  icache_req,
++    input  icache_ext_resp_t icache_resp
++  );
+ 
+   // dcache interface
+   localparam type dcache_inval_t = struct packed {
+@@ -136,7 +144,10 @@ module wt_cache_subsystem
+       .mem_rtrn_i    (adapter_icache),
+       .mem_data_req_o(icache_adapter_data_req),
+       .mem_data_ack_i(adapter_icache_data_ack),
+-      .mem_data_o    (icache_adapter)
++      .mem_data_o    (icache_adapter),
++      // sram macroports
++      .icache_req(icache_req),
++      .icache_resp(icache_resp)
+   );
+ 
+ 
+@@ -171,7 +182,10 @@ module wt_cache_subsystem
+       .mem_rtrn_i      (adapter_dcache),
+       .mem_data_req_o  (dcache_adapter_data_req),
+       .mem_data_ack_i  (adapter_dcache_data_ack),
+-      .mem_data_o      (dcache_adapter)
++      .mem_data_o      (dcache_adapter),
++      // sram macroports
++      .dcache_req(dcache_req),
++      .dcache_resp(dcache_resp)
+   );
+ 
+ 
+diff --git a/core/cache_subsystem/wt_dcache.sv b/core/cache_subsystem/wt_dcache.sv
+index c7a3a843..f9da48d5 100644
+--- a/core/cache_subsystem/wt_dcache.sv
++++ b/core/cache_subsystem/wt_dcache.sv
+@@ -16,6 +16,7 @@
+ module wt_dcache
+   import ariane_pkg::*;
+   import wt_cache_pkg::*;
++  import neurosoc_cache_pkg::*;
+ #(
+     parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
+     parameter type dcache_req_i_t = logic,
+@@ -52,10 +53,13 @@ module wt_dcache
+     input  dcache_rtrn_t mem_rtrn_i,
+     output logic         mem_data_req_o,
+     input  logic         mem_data_ack_i,
+-    output dcache_req_t  mem_data_o
+-);
++    output dcache_req_t  mem_data_o,
++
++    // sram macroports
++    output dcache_ext_req_t dcache_req,
++    input  dcache_ext_resp_t dcache_resp
++  );
+ 
+-  localparam DCACHE_CL_IDX_WIDTH = $clog2(CVA6Cfg.DCACHE_NUM_WORDS);
+ 
+   localparam type wbuffer_t = struct packed {
+     logic [CVA6Cfg.DCACHE_TAG_WIDTH+(CVA6Cfg.DCACHE_INDEX_WIDTH-CVA6Cfg.XLEN_ALIGN_BYTES)-1:0] wtag;
+@@ -361,7 +365,11 @@ module wt_dcache
+       .wr_user_i      (wr_user),
+       .wr_data_be_i   (wr_data_be),
+       // write buffer forwarding
+-      .wbuffer_data_i (wbuffer_data)
++      .wbuffer_data_i (wbuffer_data),
++      
++      // sram macroports
++      .dcache_req(dcache_req),
++      .dcache_resp(dcache_resp)
+   );
+ 
+   ///////////////////////////////////////////////////////
+diff --git a/core/cache_subsystem/wt_dcache_mem.sv b/core/cache_subsystem/wt_dcache_mem.sv
+index 391d4021..8eef4b32 100644
+--- a/core/cache_subsystem/wt_dcache_mem.sv
++++ b/core/cache_subsystem/wt_dcache_mem.sv
+@@ -29,6 +29,7 @@
+ module wt_dcache_mem
+   import ariane_pkg::*;
+   import wt_cache_pkg::*;
++  import neurosoc_cache_pkg::*;
+ #(
+     parameter config_pkg::cva6_cfg_t CVA6Cfg             = config_pkg::cva6_cfg_empty,
+     parameter                        DCACHE_CL_IDX_WIDTH = 0,
+@@ -73,10 +74,13 @@ module wt_dcache_mem
+     input logic [(CVA6Cfg.XLEN/8)-1:0] wr_data_be_i,
+ 
+     // forwarded wbuffer
+-    input wbuffer_t [DCACHE_WBUF_DEPTH-1:0] wbuffer_data_i
++    input wbuffer_t [DCACHE_WBUF_DEPTH-1:0] wbuffer_data_i,
++
++    // sram extern ports
++    output dcache_ext_req_t dcache_req,
++    input  dcache_ext_resp_t dcache_resp
+ );
+ 
+-  localparam DCACHE_NUM_BANKS = CVA6Cfg.DCACHE_LINE_WIDTH / CVA6Cfg.XLEN;
+   localparam DCACHE_NUM_BANKS_WIDTH = $clog2(DCACHE_NUM_BANKS);
+ 
+   // functions
+@@ -105,9 +109,9 @@ module wt_dcache_mem
+ 
+   logic [DCACHE_NUM_BANKS-1:0][CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.XLEN-1:0] bank_wdata;  //
+   logic [DCACHE_NUM_BANKS-1:0][CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.XLEN-1:0] bank_rdata;  //
+-  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.XLEN-1:0] rdata_cl;  // selected word from each cacheline
+   logic [DCACHE_NUM_BANKS-1:0][CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_USER_WIDTH-1:0] bank_wuser;  //
+   logic [DCACHE_NUM_BANKS-1:0][CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_USER_WIDTH-1:0] bank_ruser;  //
++  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.XLEN-1:0] rdata_cl;  // selected word from each cacheline
+   logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_USER_WIDTH-1:0]                      ruser_cl;          // selected word from each cacheline
+ 
+   logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] rd_tag;
+@@ -129,6 +133,29 @@ module wt_dcache_mem
+   logic rd_acked;
+   logic [NumPorts-1:0] bank_collision, rd_req_masked, rd_req_prio;
+ 
++  logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] [CVA6Cfg.DCACHE_TAG_WIDTH:0] vld_tag_rdata;
++
++  ///////////////////////////////////////////////////////
++  // connexion to sram extern arrays
++  ///////////////////////////////////////////////////////
++
++  assign dcache_req.bank_req = bank_req;
++  assign dcache_req.bank_we = bank_we;
++  assign dcache_req.bank_idx = bank_idx;
++  assign dcache_req.bank_wuser = bank_wuser;
++  assign dcache_req.bank_wdata = bank_wdata;
++  assign dcache_req.bank_be = bank_be;
++  assign bank_ruser = dcache_resp.bank_ruser;
++  assign bank_rdata = dcache_resp.bank_rdata;
++
++  assign dcache_req.tag_req = vld_req;
++  assign dcache_req.tag_we = vld_we;
++  assign dcache_req.tag_idx = vld_addr;
++  assign dcache_req.tag_wdata =  wr_cl_tag_i;
++  assign dcache_req.tag_wdata_vld = vld_wdata;
++  assign tag_rdata     = dcache_resp.tag_rdata;
++  assign rd_vld_bits_o = dcache_resp.tag_rdata_vld;
++
+   ///////////////////////////////////////////////////////
+   // arbiter
+   ///////////////////////////////////////////////////////
+@@ -240,7 +267,7 @@ module wt_dcache_mem
+   // hit generation
+   for (genvar i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin : gen_tag_cmpsel
+     // tag comparison of ways >0
+-    assign rd_hit_oh_o[i] = (rd_tag == tag_rdata[i]) & rd_vld_bits_o[i] & cmp_en_q;
++    assign rd_hit_oh_o[i] = (rd_tag == tag_rdata[i]) & rd_vld_bits_o[i] & cmp_en_q & ~dcache_resp.ecc_error;
+     // byte offset mux of ways >0
+     assign rdata_cl[i] = bank_rdata[bank_off_q[CVA6Cfg.DCACHE_OFFSET_WIDTH-1:CVA6Cfg.XLEN_ALIGN_BYTES]][i];
+     assign ruser_cl[i] = bank_ruser[bank_off_q[CVA6Cfg.DCACHE_OFFSET_WIDTH-1:CVA6Cfg.XLEN_ALIGN_BYTES]][i];
+@@ -297,57 +324,6 @@ module wt_dcache_mem
+     assign rd_user_o[8*k+:8] = (wbuffer_be[k]) ? wbuffer_ruser[8*k+:8] : ruser[8*k+:8];
+   end
+ 
+-  ///////////////////////////////////////////////////////
+-  // memory arrays and regs
+-  ///////////////////////////////////////////////////////
+-
+-  logic [CVA6Cfg.DCACHE_TAG_WIDTH:0] vld_tag_rdata[CVA6Cfg.DCACHE_SET_ASSOC-1:0];
+-
+-  for (genvar k = 0; k < DCACHE_NUM_BANKS; k++) begin : gen_data_banks
+-    // Data RAM
+-    sram #(
+-        .USER_WIDTH(CVA6Cfg.DCACHE_SET_ASSOC * CVA6Cfg.DCACHE_USER_WIDTH),
+-        .DATA_WIDTH(CVA6Cfg.DCACHE_SET_ASSOC * CVA6Cfg.XLEN),
+-        .USER_EN   (CVA6Cfg.DATA_USER_EN),
+-        .NUM_WORDS (CVA6Cfg.DCACHE_NUM_WORDS)
+-    ) i_data_sram (
+-        .clk_i  (clk_i),
+-        .rst_ni (rst_ni),
+-        .req_i  (bank_req[k]),
+-        .we_i   (bank_we[k]),
+-        .addr_i (bank_idx[k]),
+-        .wuser_i(bank_wuser[k]),
+-        .wdata_i(bank_wdata[k]),
+-        .be_i   (bank_be[k]),
+-        .ruser_o(bank_ruser[k]),
+-        .rdata_o(bank_rdata[k])
+-    );
+-  end
+-
+-  for (genvar i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin : gen_tag_srams
+-
+-    assign tag_rdata[i]     = vld_tag_rdata[i][CVA6Cfg.DCACHE_TAG_WIDTH-1:0];
+-    assign rd_vld_bits_o[i] = vld_tag_rdata[i][CVA6Cfg.DCACHE_TAG_WIDTH];
+-
+-    // Tag RAM
+-    sram #(
+-        // tag + valid bit
+-        .DATA_WIDTH(CVA6Cfg.DCACHE_TAG_WIDTH + 1),
+-        .NUM_WORDS (CVA6Cfg.DCACHE_NUM_WORDS)
+-    ) i_tag_sram (
+-        .clk_i  (clk_i),
+-        .rst_ni (rst_ni),
+-        .req_i  (vld_req[i]),
+-        .we_i   (vld_we),
+-        .addr_i (vld_addr),
+-        .wuser_i('0),
+-        .wdata_i({vld_wdata[i], wr_cl_tag_i}),
+-        .be_i   ('1),
+-        .ruser_o(),
+-        .rdata_o(vld_tag_rdata[i])
+-    );
+-  end
+-
+   always_ff @(posedge clk_i or negedge rst_ni) begin : p_regs
+     if (!rst_ni) begin
+       bank_idx_q <= '0;
+diff --git a/core/cva6.sv b/core/cva6.sv
+index cf445b85..64e6b6e7 100644
+--- a/core/cva6.sv
++++ b/core/cva6.sv
+@@ -16,6 +16,8 @@
+ 
+ module cva6
+   import ariane_pkg::*;
++  import neurosoc_cache_pkg::*;
++
+ #(
+     // CVA6 config
+     parameter config_pkg::cva6_cfg_t CVA6Cfg = build_config_pkg::build_config(
+@@ -292,7 +294,12 @@ module cva6
+     // noc request, can be AXI or OpenPiton - SUBSYSTEM
+     output noc_req_t noc_req_o,
+     // noc response, can be AXI or OpenPiton - SUBSYSTEM
+-    input noc_resp_t noc_resp_i
++    input noc_resp_t noc_resp_i,
++    // sram macroports
++    output dcache_ext_req_t dcache_req,
++    input  dcache_ext_resp_t dcache_resp,
++    output icache_ext_req_t  icache_req,
++    input  icache_ext_resp_t icache_resp
+ );
+ 
+   localparam type interrupts_t = struct packed {
+@@ -1162,7 +1169,12 @@ module cva6
+         .noc_resp_i        (noc_resp_i),
+         .inval_addr_i      (inval_addr),
+         .inval_valid_i     (inval_valid),
+-        .inval_ready_o     (inval_ready)
++        .inval_ready_o     (inval_ready),
++      // sram macroports
++        .dcache_req(dcache_req),
++        .dcache_resp(dcache_resp),
++        .icache_req(icache_req),
++        .icache_resp(icache_resp)
+     );
+   end else if (DCACHE_TYPE == int'(config_pkg::HPDCACHE)) begin : gen_cache_hpd
+     cva6_hpdcache_subsystem #(
+diff --git a/core/neurosoc/ecc_dec.sv b/core/neurosoc/ecc_dec.sv
+new file mode 100644
+index 00000000..c15ba3a2
+--- /dev/null
++++ b/core/neurosoc/ecc_dec.sv
+@@ -0,0 +1,319 @@
++/////////////////////////////////////////////////////////////////////
++//   ,------.                    ,--.                ,--.          //
++//   |  .--. ' ,---.  ,--,--.    |  |    ,---. ,---. `--' ,---.    //
++//   |  '--'.'| .-. |' ,-.  |    |  |   | .-. | .-. |,--.| .--'    //
++//   |  |\  \ ' '-' '\ '-'  |    |  '--.' '-' ' '-' ||  |\ `--.    //
++//   `--' '--' `---'  `--`--'    `-----' `---' `-   /`--' `---'    //
++//                                             `---'               //
++//   Error Correction and Detection Decoder                        //
++//   Parameterized Extended Hamming Code Decoder                   //
++//                                                                 //
++/////////////////////////////////////////////////////////////////////
++//                                                                 //
++//             Copyright (C) 2017 ROA Logic BV                     //
++//             www.roalogic.com                                    //
++//                                                                 //
++//   This source file may be used and distributed without          //
++//   restriction provided that this copyright statement is not     //
++//   removed from the file and that any derivative work contains   //
++//   the original copyright notice and the associated disclaimer.  //
++//                                                                 //
++//      THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY        //
++//   EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED     //
++//   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS     //
++//   FOR A PARTICULAR PURPOSE. IN NO EVENT SHALL THE AUTHOR OR     //
++//   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,  //
++//   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT  //
++//   NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;  //
++//   LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)      //
++//   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN     //
++//   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR  //
++//   OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS          //
++//   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  //
++//                                                                 //
++/////////////////////////////////////////////////////////////////////
++
++// +FHDR -  Semiconductor Reuse Standard File Header Section  -------
++// FILE NAME      : ecc_dec.sv
++// DEPARTMENT     :
++// AUTHOR         : rherveille
++// AUTHOR'S EMAIL :
++// ------------------------------------------------------------------
++// RELEASE HISTORY
++// VERSION DATE        AUTHOR      DESCRIPTION
++// 1.0     2017-04-07  rherveille  initial release
++// ------------------------------------------------------------------
++// KEYWORDS : HAMMING ERROR CORRECTION DECODER                 
++// ------------------------------------------------------------------
++// PURPOSE  : Decodes Data and ECC bits from incoming data
++//            Detects and corrects bit errors
++// ------------------------------------------------------------------
++// PARAMETERS
++//  PARAM NAME        RANGE  DESCRIPTION              DEFAULT UNITS
++//  K                 1+     Information vector size  8
++//  LATENCY           0,1,2  0: No latency            0
++//                           1: Registered outputs
++//                           2: Registered inputs/outputs
++//  P0_LSB            0,1    0: p0 located at MSB     1
++//                           1: p0 located at LSB
++// ------------------------------------------------------------------
++// REUSE ISSUES 
++//   Reset Strategy      : external asynchronous active low; rst_ni
++//   Clock Domains       : 1, clk_i, rising edge
++//   Critical Timing     :
++//   Test Features       : na
++//   Asynchronous I/F    : no
++//   Scan Methodology    : na
++//   Instantiations      : none
++//   Synthesizable (y/n) : Yes
++//   Other               :                                         
++// -FHDR-------------------------------------------------------------
++
++
++//-----------------------------------------------------------------------------
++// Hamming codes can detect and correct a single bit error.
++// An extended Hamming code allows detection of double bit errors and
++// correction of single bit errors.
++// This is called SECDED; Single Error Correction, Double Error Detection
++//
++// Number of bits required by a Hamming code: n = m + k
++// n = code length
++// m = number of check bits
++// k = number of information bits
++//
++// Information, parity, and syndrome expressed as vectors:
++// u = Information bit vector
++// p = Parity check bit vector
++// s = Syndrome vector
++//
++// The parity vector is encoded in 'n'.
++// The information bit vector is part of 'p'
++// The syndrome vector needs to be calculated.
++//
++// Bits required:
++// p ranges from 0 to m+k; or p_range=m+k+1
++// As a result 2^m >= m+k+1
++//-----------------------------------------------------------------------------
++
++module ecc_dec #(
++  parameter K       = 8, //Information bit vector size
++  parameter LATENCY = 0, //0: no latency (combinatorial design)
++                         //1: registered outputs
++                         //2: registered inputs+outputs
++  parameter P0_LSB  = 1, //0: p0 is located at MSB
++                         //1: p0 is located at LSB
++
++  //These should be localparams
++  parameter m = calculate_m(K),
++  parameter n = m + K
++)
++(
++  //clock/reset ports (if LATENCY > 0)
++  input              rst_ni,     //asynchronous reset
++  input              clk_i,      //clock input
++  input              clkena_i,   //clock enable input
++
++  //data ports
++  input      [n  :0] d_i,        //encoded code word input
++  output reg [K-1:0] q_o,        //information bit vector output
++  output reg [K-1:0] q_err_o,    //non repaired information bit vector output
++  output reg [m  :0] syndrome_o, //syndrome vector output
++
++  //flags
++  output reg         sb_err_o,   //single bit error detected
++  output reg         db_err_o,   //double bit error detected
++  output reg         sb_fix_o    //repaired error in the information bits
++);
++
++//---------------------------------------------------------
++// Functions
++//---------------------------------------------------------
++function integer calculate_m(input integer k);
++  integer m;
++begin
++  m=1;
++  while (2**m < m+k+1) m++;
++
++  calculate_m = m;
++end
++endfunction //calculate_m
++
++
++function [m:1] calculate_syndrome(input [n:0] cw);
++  integer p_idx, cw_idx;
++begin
++    //clear syndrome
++    calculate_syndrome = 0;
++
++    for (p_idx =1; p_idx <=m; p_idx++)  //parity vector index
++    for (cw_idx=1; cw_idx<=n; cw_idx++) //code-word index
++      if (|(2**(p_idx-1) & cw_idx)) calculate_syndrome[p_idx] = calculate_syndrome[p_idx] ^ cw[cw_idx];
++end
++endfunction //calculate_syndrome
++
++
++function [n:0] correct_codeword(input [n:0] cw, input [m:1] syndrome);
++    /*
++      Correct all bits, including parity bits and extended parity bit.
++      This simplifies this section and keeps the logic simple.
++
++      The parity-bits are not used when extracting the information bits vector.
++      Dead-logic-removal gets rid of the generated logic for the parity bits.
++    */
++
++    //assign code word
++    correct_codeword = cw;
++
++    //then invert bit indicated by syndrome
++    correct_codeword[syndrome] = ~correct_codeword[syndrome];
++endfunction //correct_codeword
++
++
++function [K-1:0] extract_q(input [n:0] cw);
++  integer bit_idx, cw_idx;
++begin
++    //This function extracts the information bits vector from the codeword
++    //information bits are stored in non-power-of-2 locations
++
++    bit_idx=0; //information bit vector index
++    for (cw_idx=1; cw_idx<=n; cw_idx++) //codeword index
++      if (2**$clog2(cw_idx) != cw_idx)
++        extract_q[bit_idx++] = cw[cw_idx];
++end
++endfunction //extract_q
++
++
++function is_power_of_2(input int n);
++    is_power_of_2 = (n & (n-1)) == 0;
++endfunction
++
++
++function information_error(input [m:1] syndrome);
++begin
++    //This function checks if an error was detected/corrected in the information bits
++    information_error = |syndrome & !is_power_of_2(syndrome);
++end
++endfunction //information_error
++
++
++//---------------------------------------------------------
++// Variables 
++//---------------------------------------------------------
++wire          parity;      //full codeword parity check
++logic         parity_reg;
++wire  [m  :1] syndrome;    //bit error indication/location
++logic [m  :1] syndrome_reg;
++wire  [n  :0] cw_fixed;    //corrected code word
++wire  [n  :0] cw;         //non corrected code word
++  
++wire  [n  :0] d;
++logic [n  :0] d_reg;
++wire  [K-1:0] q;
++wire  [K-1:0] q_err;
++wire          sb_err;
++wire          db_err;
++wire          sb_fix;
++
++//---------------------------------------------------------
++// Module Body
++//---------------------------------------------------------
++
++/*
++  Below diagram indicates the locations of the parity and data bits
++  in the final 'p' vector.
++  It also shows what databits each parity bit operates on
++
++    1  2  3  4  5  6  7  8  9 10 11 12 13  14  15
++   p1 p2 d1 p4 d2 d3 d4 p8 d5 d6 d7 d8 d9 d10 d11
++p1  x     x     x     x     x     x     x       x
++p2     x  x        x  x        x  x         x   x
++p4           x  x  x  x              x  x   x   x
++p8                       x  x  x  x  x  x   x   x
++*/
++
++//Step 1: Locate Parity bit
++assign d = P0_LSB ? d_i : {d_i[n-1:0],d_i[n]};
++
++//Step 2: Calculate code word parity
++assign parity = ^d;
++
++//Step 3: Calculate syndrome
++assign syndrome = calculate_syndrome(d);
++
++//Step 4: Generate intermediate registers (if any)
++generate
++  if (LATENCY > 1)
++  begin
++      always @(posedge clk_i or negedge rst_ni)
++        if (!rst_ni)
++        begin
++            d_reg        <= {n+1{1'b0}};
++            parity_reg   <= 1'b0;
++            syndrome_reg <= {m{1'b0}};
++        end
++        else if (clkena_i)
++        begin
++            d_reg        <= d;
++            parity_reg   <= parity;
++            syndrome_reg <= syndrome;
++        end
++  end
++  else
++  begin
++      assign d_reg        = d;
++      assign parity_reg   = parity;
++      assign syndrome_reg = syndrome;
++  end
++endgenerate
++
++//Step 5: Correct erroneous bit (if any)
++assign cw_fixed = correct_codeword(d_reg, syndrome_reg); 
++
++//Step 6: Extract information bits vector
++assign q = extract_q(cw_fixed);
++assign q_err = extract_q(d_reg);
++
++//Step 7: Generate status flags
++assign sb_err =  parity_reg & |syndrome_reg;
++assign db_err = ~parity_reg & |syndrome_reg;
++assign sb_fix =  parity_reg & |information_error(syndrome_reg);
++
++//Step 8: Generate output registers (if required)
++generate
++  if (LATENCY > 0) //
++  begin //Generate output registers
++      always @(posedge clk_i or negedge rst_ni)
++        if (!rst_ni)
++        begin
++            q_o        <= {K{1'b0}};
++            q_err_o    <= {K{1'b0}};
++            syndrome_o <= {m+1{1'b0}};
++            sb_err_o   <= 1'b0;
++            db_err_o   <= 1'b0;
++            sb_fix_o   <= 1'b0;
++        end
++        else if (clkena_i)
++        begin
++            q_o        <= q;
++            q_err_o    <= q_err;
++            syndrome_o <= P0_LSB ? {syndrome_reg, parity_reg} : {parity_reg, syndrome_reg};
++            sb_err_o   <= sb_err;
++            db_err_o   <= db_err;
++            sb_fix_o   <= sb_fix;
++        end
++  end
++  else
++  begin //No output registers
++      always_comb
++      begin
++          q_o        = q;
++          q_err_o    <= q_err;
++          syndrome_o = P0_LSB ? {syndrome_reg, parity_reg} : {parity_reg, syndrome_reg};
++          sb_err_o   = sb_err;
++          db_err_o   = db_err;
++          sb_fix_o   = sb_fix;
++      end
++  end
++endgenerate
++
++endmodule
+diff --git a/core/neurosoc/ecc_enc.sv b/core/neurosoc/ecc_enc.sv
+new file mode 100644
+index 00000000..ce079063
+--- /dev/null
++++ b/core/neurosoc/ecc_enc.sv
+@@ -0,0 +1,217 @@
++/////////////////////////////////////////////////////////////////////
++//   ,------.                    ,--.                ,--.          //
++//   |  .--. ' ,---.  ,--,--.    |  |    ,---. ,---. `--' ,---.    //
++//   |  '--'.'| .-. |' ,-.  |    |  |   | .-. | .-. |,--.| .--'    //
++//   |  |\  \ ' '-' '\ '-'  |    |  '--.' '-' ' '-' ||  |\ `--.    //
++//   `--' '--' `---'  `--`--'    `-----' `---' `-   /`--' `---'    //
++//                                             `---'               //
++//   Error Correction and Detection Encoder                        //
++//   Parameterized Extended Hamming Code Encoder                   //
++//                                                                 //
++/////////////////////////////////////////////////////////////////////
++//                                                                 //
++//             Copyright (C) 2017 ROA Logic BV                     //
++//             www.roalogic.com                                    //
++//                                                                 //
++//   This source file may be used and distributed without          //
++//   restriction provided that this copyright statement is not     //
++//   removed from the file and that any derivative work contains   //
++//   the original copyright notice and the associated disclaimer.  //
++//                                                                 //
++//      THIS SOFTWARE IS PROVIDED ``AS IS'' AND WITHOUT ANY        //
++//   EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED     //
++//   TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS     //
++//   FOR A PARTICULAR PURPOSE. IN NO EVENT SHALL THE AUTHOR OR     //
++//   CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,  //
++//   SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT  //
++//   NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;  //
++//   LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)      //
++//   HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN     //
++//   CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR  //
++//   OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS          //
++//   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.  //
++//                                                                 //
++/////////////////////////////////////////////////////////////////////
++
++// +FHDR -  Semiconductor Reuse Standard File Header Section  -------
++// FILE NAME      : ecc_enc.sv
++// DEPARTMENT     :
++// AUTHOR         : rherveille
++// AUTHOR'S EMAIL :
++// ------------------------------------------------------------------
++// RELEASE HISTORY
++// VERSION DATE        AUTHOR      DESCRIPTION
++// 1.0     2017-04-07  rherveille  initial release
++// ------------------------------------------------------------------
++// KEYWORDS : HAMMING ERROR CORRECTION ENCODER                 
++// ------------------------------------------------------------------
++// PURPOSE  : Adds ECC bits to incoming data
++// ------------------------------------------------------------------
++// PARAMETERS
++//  PARAM NAME        RANGE  DESCRIPTION              DEFAULT UNITS
++//  K                 1+     Information vector size  8
++//  P0_LSB            0,1    0: p0 located at MSB     1
++//                           1: p0 located at LSB
++// ------------------------------------------------------------------
++// REUSE ISSUES 
++//   Reset Strategy      : none
++//   Clock Domains       : none
++//   Critical Timing     :
++//   Test Features       : na
++//   Asynchronous I/F    : yes
++//   Scan Methodology    : na
++//   Instantiations      : none
++//   Synthesizable (y/n) : Yes
++//   Other               :                                         
++// -FHDR-------------------------------------------------------------
++
++
++//-----------------------------------------------------------------------------
++// Hamming codes can detect and correct a single bit error.
++// An extended Hamming code allows detection of double bit errors and
++// correction of single bit errors.
++// This is called SECDED; Single Error Correction, Double Error Detection
++//
++// Number of bits required by a Hamming code: n = m + k
++// n = code length
++// m = number of check bits
++// k = number of information bits
++//
++// Information, parity, and syndrome expressed as vectors:
++// u = Information bit vector
++// p = Parity check bit vector
++// s = Syndrome vector
++//
++// The parity vector is encoded in 'n'.
++// The information bit vector is part of 'p'
++// The syndrome vector needs to be calculated.
++//
++// Bits required:
++// p ranges from 0 to m+k; or p_range=m+k+1
++// As a result 2^m >= m+k+1
++//-----------------------------------------------------------------------------
++
++
++module ecc_enc #(
++  parameter K       = 8, //Information bit vector size
++  parameter P0_LSB  = 1, //0: p0 is located at MSB
++                         //1: p0 is located at LSB
++
++  //these should be localparams
++  parameter m = calculate_m(K),
++  parameter n = m + K
++)
++(
++  input  [K-1:0] d_i,      //information bit vector input
++  output [n  :0] q_o,      //encoded data word output
++
++  output [m  :1] p_o,      //parity vector output
++  output         p0_o      //extended parity bit
++);
++
++
++//---------------------------------------------------------
++// Functions
++//---------------------------------------------------------
++function integer calculate_m;
++  input integer k;
++
++  integer m;
++begin
++  m=1;
++  while (2**m < m+k+1) m++;
++
++  calculate_m = m;
++end
++endfunction //calculate_m
++
++
++function [n:1] store_dbits_in_codeword;
++  input [K-1:0] d;
++
++  integer bit_idx, cw_idx;
++begin
++    //This function puts the information bits vector in the correct location
++    //Information bits are stored in non-power-of-2 locations
++
++    //clear all bits
++    store_dbits_in_codeword = 0;
++
++    bit_idx=0; //information vector bit index
++    for (cw_idx=1; cw_idx<=n; cw_idx++)
++      if (2**$clog2(cw_idx) != cw_idx)
++        store_dbits_in_codeword[cw_idx] = d[bit_idx++];
++end
++endfunction //store_dbits_in_codeword
++
++
++function [m:1] calculate_p;
++  input [n:1] cw;
++
++  integer p_idx, cw_idx;
++begin
++    //clear p
++    calculate_p = 0;
++
++    for (p_idx =1; p_idx <=m; p_idx++)  //parity-index
++    for (cw_idx=1; cw_idx<=n; cw_idx++) //codeword-index
++      if (|(2**(p_idx-1) & cw_idx)) calculate_p[p_idx] = calculate_p[p_idx] ^ cw[cw_idx];
++end
++endfunction //calculate_p
++
++
++function [n:1] store_p_in_codeword;
++  input [n:1] cw;
++  input [m:1] p;
++
++  integer i;
++begin
++    //databits don't change ... copy into codeword
++    store_p_in_codeword = cw;
++
++    //put parity vector at power-of-2 locations
++    for (i=1; i<=m; i=i+1)
++      store_p_in_codeword[2**(i-1)] = p[i];
++end
++endfunction //store_p_in_codeword
++
++
++//---------------------------------------------------------
++// Variables
++//---------------------------------------------------------
++logic [n:1] cw_w_dbits; //codeword with loaded data bits
++logic [n:1] cw;         //codeword with information + parity bits
++  
++
++//---------------------------------------------------------
++// Module Body
++//---------------------------------------------------------
++
++/*
++  Below diagram indicates the locations of the parity and data bits
++  in the final 'p' vector.
++  It also shows what databits each parity bit operates on
++
++    1  2  3  4  5  6  7  8  9 10 11 12 13  14  15
++   p1 p2 d1 p4 d2 d3 d4 p8 d5 d6 d7 d8 d9 d10 d11
++p1  x     x     x     x     x     x     x       x
++p2     x  x        x  x        x  x         x   x
++p4           x  x  x  x              x  x   x   x
++p8                       x  x  x  x  x  x   x   x
++*/
++
++//Step 1: Load all databits in codeword
++assign cw_w_dbits = store_dbits_in_codeword(d_i);
++
++//Step 2: Calculate p-vector
++assign p_o = calculate_p(cw_w_dbits);
++
++//Step 3: Store p-vector in codeword
++assign cw = store_p_in_codeword(cw_w_dbits, p_o);
++
++//Step 4: Calculate p0 (extended parity bit)
++//        and store it in the codeword
++assign p0_o = ^cw;
++assign q_o  = P0_LSB ? {cw,p0_o} : {p0_o,cw};
++
++endmodule
+diff --git a/core/neurosoc/neurosoc_cache_pkg.sv b/core/neurosoc/neurosoc_cache_pkg.sv
+new file mode 100644
+index 00000000..ae4cd9b8
+--- /dev/null
++++ b/core/neurosoc/neurosoc_cache_pkg.sv
+@@ -0,0 +1,112 @@
++// Copyright (c) 2023 - 2025 Thales
++// All Rights Reserved. 
++//
++// Author: Abdou Lahat NDIAYE, Thales cortAIx Labs
++// Date: 29.01.2025
++//
++// Description: Includes parameters of data and instruction cache SRAM externalized  
++//
++// ========================================================================== //
++// Revisions  :
++// Date        Version  Author              Description
++// 2025-01-29  0.1      Abdou Lahat NDIAYE  first functional release
++// ========================================================================== //
++
++package neurosoc_cache_pkg;
++
++  localparam config_pkg::cva6_cfg_t CVA6Cfg = build_config_pkg::build_config(
++      cva6_config_pkg::cva6_cfg
++  );
++  localparam DCACHE_CL_IDX_WIDTH = $clog2(CVA6Cfg.DCACHE_NUM_WORDS);
++  localparam DCACHE_NUM_BANKS = CVA6Cfg.DCACHE_LINE_WIDTH / CVA6Cfg.XLEN;
++
++  localparam DCACHE_TAG_WIDTH_NEW = CVA6Cfg.DCACHE_TAG_WIDTH + 1;
++  // Add extra bits to make the SRAM width byte_aligned
++  localparam DCACHE_TAG_SRAM_WIDTH = DCACHE_TAG_WIDTH_NEW + (8 - (DCACHE_TAG_WIDTH_NEW % 8)) % 8;
++  localparam BE_DCACHE_TAG_WIDTH = DCACHE_TAG_SRAM_WIDTH / 8;
++
++  typedef struct packed {
++    logic [DCACHE_NUM_BANKS-1:0] bank_req;
++    logic [DCACHE_NUM_BANKS-1:0] bank_we;
++    logic [DCACHE_NUM_BANKS-1:0] [CVA6Cfg.DCACHE_SET_ASSOC-1:0][(CVA6Cfg.XLEN/8)-1:0]          bank_be;
++    logic [DCACHE_NUM_BANKS-1:0][DCACHE_CL_IDX_WIDTH-1:0] bank_idx;
++    logic [DCACHE_NUM_BANKS-1:0] [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.XLEN-1:0]              bank_wdata;
++    logic [DCACHE_NUM_BANKS-1:0] [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_USER_WIDTH-1:0] bank_wuser;
++
++    logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] tag_req;
++    logic                                tag_we;
++    logic [DCACHE_CL_IDX_WIDTH-1:0]      tag_idx;
++    logic [CVA6Cfg.DCACHE_TAG_WIDTH-1:0] tag_wdata;
++    logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0] tag_wdata_vld;
++  } dcache_ext_req_t;
++
++  typedef struct packed {
++    logic [DCACHE_NUM_BANKS-1:0] [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.XLEN-1:0]              bank_rdata;
++    logic [DCACHE_NUM_BANKS-1:0] [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_USER_WIDTH-1:0] bank_ruser;
++
++    logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0][CVA6Cfg.DCACHE_TAG_WIDTH-1:0] tag_rdata;
++    logic [CVA6Cfg.DCACHE_SET_ASSOC-1:0]                               tag_rdata_vld;
++
++    logic ecc_error;
++  } dcache_ext_resp_t;
++
++
++  // Cache Instruction
++
++  typedef struct packed {
++    logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0]       data_req;
++    logic                                      data_we;
++    logic [ICACHE_CL_IDX_WIDTH-1:0]            data_idx;
++    logic [CVA6Cfg.ICACHE_LINE_WIDTH-1:0]      data_wdata;
++    logic [CVA6Cfg.ICACHE_USER_LINE_WIDTH-1:0] data_wuser;
++
++    logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0]                             tag_req;
++    logic                                                            tag_we;
++    logic [ICACHE_CL_IDX_WIDTH-1:0]                                  tag_idx;
++    logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_TAG_WIDTH:0] tag_wdata;
++  } icache_ext_req_t;
++
++  typedef struct packed {
++    logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_LINE_WIDTH-1:0]      data_rdata;
++    logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_USER_LINE_WIDTH-1:0] data_ruser;
++
++    logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][CVA6Cfg.ICACHE_TAG_WIDTH:0] tag_rdata;
++    logic                                                            ecc_error;
++  } icache_ext_resp_t;
++
++
++  localparam ICACHE_OFFSET_WIDTH = $clog2(CVA6Cfg.ICACHE_LINE_WIDTH / 8);
++  localparam ICACHE_NUM_WORDS = 2 ** (CVA6Cfg.ICACHE_INDEX_WIDTH - ICACHE_OFFSET_WIDTH);
++  localparam ICACHE_CL_IDX_WIDTH = $clog2(ICACHE_NUM_WORDS);
++
++  // ECC 
++  function integer calculate_parity_size;
++    input integer k;
++    integer m;
++    begin
++      m = 1;
++      while (2 ** m < m + k + 1) m++;
++      calculate_parity_size = m;
++    end
++  endfunction  //calculate_parity_size
++
++  localparam bit unsigned ECC_EN = 1;
++
++  localparam int unsigned TAG_ECC_PARITY_SIZE = ECC_EN ? calculate_parity_size(
++      CVA6Cfg.ICACHE_TAG_WIDTH + 1
++  ) + 1 : 0;
++  localparam int unsigned DATA_ECC_PARITY_SIZE = ECC_EN ? calculate_parity_size(
++      CVA6Cfg.ICACHE_LINE_WIDTH
++  ) + 1 : 0;
++
++  localparam ICACHE_TAG_WIDTH_NEW = CVA6Cfg.ICACHE_TAG_WIDTH + 1 + TAG_ECC_PARITY_SIZE;
++  // Add extra bits to make the SRAM width byte_aligned
++  localparam ICACHE_TAG_SRAM_WIDTH = ICACHE_TAG_WIDTH_NEW + (8 - (ICACHE_TAG_WIDTH_NEW % 8)) % 8;
++  localparam BE_ICACHE_TAG_WIDTH = ICACHE_TAG_SRAM_WIDTH / 8;
++
++  localparam ICACHE_DATA_WIDTH_NEW = CVA6Cfg.ICACHE_LINE_WIDTH + DATA_ECC_PARITY_SIZE;
++  // Add extra bits to make the SRAM width byte_aligned
++  localparam ICACHE_DATA_SRAM_WIDTH = ICACHE_DATA_WIDTH_NEW + (8 - (ICACHE_DATA_WIDTH_NEW % 8)) % 8;
++  localparam BE_ICACHE_DATA_WIDTH = ICACHE_DATA_SRAM_WIDTH / 8;
++
++endpackage
+\ No newline at end of file
+diff --git a/core/neurosoc/neurosoc_cache_sram_ext.sv b/core/neurosoc/neurosoc_cache_sram_ext.sv
+new file mode 100644
+index 00000000..7765516c
+--- /dev/null
++++ b/core/neurosoc/neurosoc_cache_sram_ext.sv
+@@ -0,0 +1,254 @@
++// Copyright (c) 2023 - 2025 Thales
++// All Rights Reserved. 
++//
++// Author: Abdou Lahat NDIAYE, Thales cortAIx Labs
++// Date: 29.01.2025
++//
++// Description: Externalized SRAMs for data cache and instrction cache wich include single & double error correction
++//
++// ========================================================================== //
++// Revisions  :
++// Date        Version  Author              Description
++// 2025-01-29  0.1      Abdou Lahat NDIAYE  first functional release
++// ========================================================================== //
++
++module neurosoc_cache_sram_ext
++  import ariane_pkg::*;
++  import wt_cache_pkg::*;
++  import neurosoc_cache_pkg::*;
++#(
++    parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty
++) (
++    input logic clk_i,
++    input logic rst_ni,
++
++    input  dcache_ext_req_t  dcache_req,
++    output dcache_ext_resp_t dcache_resp,
++    input  icache_ext_req_t  icache_req,
++    output icache_ext_resp_t icache_resp
++);
++
++//DATA CACHE
++
++  for (genvar k = 0; k < DCACHE_NUM_BANKS; k++) begin : gen_data_banks
++    // Data RAM
++    sram #(
++        .USER_WIDTH(CVA6Cfg.DCACHE_SET_ASSOC * CVA6Cfg.DCACHE_USER_WIDTH),
++        .DATA_WIDTH(CVA6Cfg.DCACHE_SET_ASSOC * CVA6Cfg.XLEN),
++        .USER_EN   (CVA6Cfg.DATA_USER_EN),
++        .NUM_WORDS (CVA6Cfg.DCACHE_NUM_WORDS)
++    ) i_data_sram (
++        .clk_i  (clk_i),
++        .rst_ni (rst_ni),
++        .req_i  (dcache_req.bank_req[k]),
++        .we_i   (dcache_req.bank_we[k]),
++        .addr_i (dcache_req.bank_idx[k]),
++        .wuser_i(dcache_req.bank_wuser[k]),
++        .wdata_i(dcache_req.bank_wdata[k]),
++        .be_i   (dcache_req.bank_be[k]),
++        .ruser_o(dcache_resp.bank_ruser[k]),
++        .rdata_o(dcache_resp.bank_rdata[k])
++    );
++  end
++
++  logic [CVA6Cfg.DCACHE_SET_ASSOC*DCACHE_TAG_SRAM_WIDTH -1 :0] dcache_data_sram_wdata;
++  logic [CVA6Cfg.DCACHE_SET_ASSOC*DCACHE_TAG_SRAM_WIDTH -1 :0] dcache_data_sram_rdata;
++  logic [CVA6Cfg.DCACHE_SET_ASSOC*BE_DCACHE_TAG_WIDTH-1 : 0] dcache_data_sram_be;
++  
++  // Linearization
++  for (genvar i = 0; i < CVA6Cfg.DCACHE_SET_ASSOC; i++) begin : gen_sram_dcache_concat
++    assign dcache_data_sram_wdata[i*DCACHE_TAG_SRAM_WIDTH +:DCACHE_TAG_SRAM_WIDTH ] = {
++      1'b0, dcache_req.tag_wdata_vld[i], dcache_req.tag_wdata
++    };
++    assign dcache_data_sram_be[i*BE_DCACHE_TAG_WIDTH +: BE_DCACHE_TAG_WIDTH] = {BE_DCACHE_TAG_WIDTH{dcache_req.tag_req[i]}};
++    assign {dcache_resp.tag_rdata_vld[i],dcache_resp.tag_rdata[i]} = dcache_data_sram_rdata[i*DCACHE_TAG_SRAM_WIDTH  +: DCACHE_TAG_SRAM_WIDTH ];
++  end
++
++  // Tag RAM
++  sram #(
++      // tag + valid bit
++      .DATA_WIDTH(CVA6Cfg.DCACHE_SET_ASSOC * DCACHE_TAG_SRAM_WIDTH),
++      .NUM_WORDS (CVA6Cfg.DCACHE_NUM_WORDS)
++  ) i_tag_sram (
++      .clk_i  (clk_i),
++      .rst_ni (rst_ni),
++      .req_i  ('1),
++      .we_i   (dcache_req.tag_we),
++      .addr_i (dcache_req.tag_idx),
++      .wuser_i('0),
++      .wdata_i(dcache_data_sram_wdata),
++      .be_i   (dcache_data_sram_be),
++      .ruser_o(),
++      .rdata_o(dcache_data_sram_rdata)
++  );
++// end of DATA CACHE
++
++
++//INSTRUCTION CACHE
++
++  logic [CVA6Cfg.ICACHE_SET_ASSOC*ICACHE_TAG_SRAM_WIDTH-1 : 0] icache_tag_sram_wdata;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC*ICACHE_TAG_SRAM_WIDTH-1 : 0] icache_tag_sram_rdata;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC*BE_ICACHE_TAG_WIDTH-1 : 0] icache_tag_sram_be;
++
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][ICACHE_TAG_SRAM_WIDTH-1 : 0] icache_tag_wdata_enc;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][ICACHE_TAG_SRAM_WIDTH-1 : 0] icache_tag_wdata_enc_q;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][ICACHE_TAG_SRAM_WIDTH-1 : 0] icache_tag_rdata_pre_dec;
++
++  logic [CVA6Cfg.ICACHE_SET_ASSOC*ICACHE_DATA_SRAM_WIDTH-1 : 0] data_sram_rdata;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC*CVA6Cfg.ICACHE_USER_LINE_WIDTH-1 : 0] data_sram_ruser;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC*BE_ICACHE_DATA_WIDTH-1 : 0] data_sram_be;
++
++  logic [ICACHE_DATA_SRAM_WIDTH-1 : 0] icache_data_wdata_enc;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0][ICACHE_DATA_SRAM_WIDTH-1 :0] icache_data_rdata_pre_dec;
++
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] sb_err_tag;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] db_err_tag;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] sb_err_data;
++  logic [CVA6Cfg.ICACHE_SET_ASSOC-1:0] db_err_data;
++
++  for (genvar i = 0; i < CVA6Cfg.ICACHE_SET_ASSOC; i++) begin : gen_ecc
++    assign icache_tag_wdata_enc[i][ICACHE_TAG_SRAM_WIDTH-1:ICACHE_TAG_WIDTH_NEW] = '0;
++
++    if (neurosoc_cache_pkg::ECC_EN) begin : gen_ecc
++
++      // Encode tag
++      ecc_enc #(
++        .K     (CVA6Cfg.ICACHE_TAG_WIDTH + 1),  // tag + valid bit
++        .P0_LSB(0)                              // p0 is located at MSB
++      ) ecc_enc_tag (
++        .d_i (icache_req.tag_wdata[i]),
++        .q_o (icache_tag_wdata_enc[i][ICACHE_TAG_WIDTH_NEW-1 : 0]),
++        .p_o (),
++        .p0_o()
++      );
++
++      // Decode tag
++      ecc_dec #(
++        .K      (CVA6Cfg.ICACHE_TAG_WIDTH + 1),  // tag + valid bit
++        .LATENCY(0),                             //0: no latency (combinatorial design)
++                                                  //1: registered outputs
++                                                  //2: registered inputs+outputs
++        .P0_LSB (0)                              //0: p0 is located at MSB
++                                                  //1: p0 is located at LSB
++      ) ecc_dec_tag (
++        //clock/reset ports (if LATENCY > 0)
++        .rst_ni(rst_ni),  //asynchronous reset
++        .clk_i(clk_i),  //clock input
++        .clkena_i(1'b1),  //clock enable input
++        //data ports
++        .d_i(icache_tag_rdata_pre_dec[i][ICACHE_TAG_WIDTH_NEW-1 : 0]),  //encoded code word input
++        //.q_o        (cl_tag_valid_rdata_dec[i]),        //information bit vector output
++        .q_o(),  //information bit vector output
++        .q_err_o(icache_resp.tag_rdata[i]),  //information bit vector output
++        .syndrome_o(),  //syndrome vector output
++        //flags
++        .sb_err_o(sb_err_tag[i]),  //single bit error detected
++        .db_err_o(db_err_tag[i]),  //double bit error detected
++        .sb_fix_o()  //repaired error in the information bits
++      );
++
++      // Decode data
++      ecc_dec #(
++        .K      (CVA6Cfg.ICACHE_LINE_WIDTH),
++        .LATENCY(0),                          //0: no latency (combinatorial design)
++                                              //1: registered outputs
++                                              //2: registered inputs+outputs
++        .P0_LSB (0)                           //0: p0 is located at MSB
++                                              //1: p0 is located at LSB
++      ) ecc_dec_data (
++        //clock/reset ports (if LATENCY > 0)
++        .rst_ni(rst_ni),  //asynchronous reset
++        .clk_i(clk_i),  //clock input
++        .clkena_i(1'b1),  //clock enable input
++        //data ports
++        .d_i        (icache_data_rdata_pre_dec[i][ICACHE_DATA_WIDTH_NEW - 1 :0]),        //encoded code word input
++        //.q_o        (cl_tag_valid_rdata_dec[i]),        //information bit vector output
++        .q_o(),  //information bit vector output
++        .q_err_o(icache_resp.data_rdata[i]),  //information bit vector output
++        .syndrome_o(),  //syndrome vector output
++        //flags
++        .sb_err_o(sb_err_data[i]),  //single bit error detected
++        .db_err_o(db_err_data[i]),  //double bit error detected
++        .sb_fix_o()  //repaired error in the information bits
++      );
++
++    end else begin
++      assign icache_tag_wdata_enc[i][ICACHE_TAG_WIDTH_NEW-1 : 0] = icache_req.tag_wdata[i];
++      assign icache_resp.tag_rdata[i] = icache_tag_rdata_pre_dec[i][ICACHE_TAG_WIDTH_NEW-1 : 0];
++
++      assign icache_resp.data_rdata[i] = icache_data_rdata_pre_dec[i][ICACHE_DATA_WIDTH_NEW-1 : 0];
++    end
++  end
++
++  // Encode data
++  if (neurosoc_cache_pkg::ECC_EN) begin
++
++    ecc_enc #(
++      .K     (CVA6Cfg.ICACHE_LINE_WIDTH),  // tag + valid bit
++      .P0_LSB(0)                           // p0 is located at MSB
++    ) ecc_enc_data (
++        .d_i (icache_req.data_wdata),
++        .q_o (icache_data_wdata_enc[ICACHE_DATA_WIDTH_NEW-1 : 0]),
++        .p_o (),
++        .p0_o()
++    );
++  end else begin
++    assign icache_data_wdata_enc[ICACHE_DATA_WIDTH_NEW-1 : 0] = icache_req.data_wdata;
++  end
++  assign icache_data_wdata_enc[ICACHE_DATA_SRAM_WIDTH-1:ICACHE_DATA_WIDTH_NEW] = '0;
++
++
++  assign icache_resp.ecc_error = (neurosoc_cache_pkg::ECC_EN) ? |sb_err_tag | |db_err_tag |sb_err_data | |db_err_data : 1'b0;
++
++  // Linearization of memory signals 
++  for (genvar i = 0; i < CVA6Cfg.ICACHE_SET_ASSOC; i++) begin : gen_sram_concat
++
++    assign icache_tag_sram_wdata[i*(ICACHE_TAG_SRAM_WIDTH) +: (ICACHE_TAG_SRAM_WIDTH)] = icache_tag_wdata_enc[i];
++    assign icache_tag_sram_be[i*BE_ICACHE_TAG_WIDTH +: BE_ICACHE_TAG_WIDTH] = {BE_ICACHE_TAG_WIDTH{icache_req.tag_req[i]}};
++    assign icache_tag_rdata_pre_dec[i] = icache_tag_sram_rdata[i*(ICACHE_TAG_SRAM_WIDTH) +: (ICACHE_TAG_SRAM_WIDTH)];
++
++    assign data_sram_be[i*BE_ICACHE_DATA_WIDTH +: BE_ICACHE_DATA_WIDTH] = {BE_ICACHE_DATA_WIDTH{icache_req.data_req[i]}};
++    assign icache_data_rdata_pre_dec[i] = data_sram_rdata[i*ICACHE_DATA_SRAM_WIDTH +: ICACHE_DATA_SRAM_WIDTH];
++    assign icache_resp.data_ruser[i] = data_sram_ruser[i*CVA6Cfg.ICACHE_LINE_WIDTH +: CVA6Cfg.ICACHE_LINE_WIDTH];
++
++  end
++
++  // Tag RAM
++  sram #(
++      // tag + valid bit
++      .DATA_WIDTH(CVA6Cfg.ICACHE_SET_ASSOC * (ICACHE_TAG_SRAM_WIDTH)),
++      .NUM_WORDS (ICACHE_NUM_WORDS)
++  ) tag_sram (
++      .clk_i  (clk_i),
++      .rst_ni (rst_ni),
++      .req_i  ('1),
++      .we_i   (icache_req.tag_we),
++      .addr_i (icache_req.tag_idx),
++      .wuser_i('0),
++      .wdata_i(icache_tag_sram_wdata),
++      .be_i   (icache_tag_sram_be),
++      .ruser_o(),
++      .rdata_o(icache_tag_sram_rdata)
++  );
++
++  // Data RAM
++  sram #(
++      .USER_WIDTH(CVA6Cfg.ICACHE_SET_ASSOC*CVA6Cfg.ICACHE_USER_LINE_WIDTH),
++      .DATA_WIDTH(CVA6Cfg.ICACHE_SET_ASSOC*ICACHE_DATA_SRAM_WIDTH),
++      .USER_EN   (CVA6Cfg.FETCH_USER_EN),
++      .NUM_WORDS (ICACHE_NUM_WORDS)
++  ) data_sram (
++      .clk_i  (clk_i),
++      .rst_ni (rst_ni),
++      .req_i  ('1),
++      .we_i   (icache_req.data_we),
++      .addr_i (icache_req.data_idx),
++      .wuser_i({CVA6Cfg.ICACHE_SET_ASSOC{icache_req.data_wuser}}),
++      .wdata_i({CVA6Cfg.ICACHE_SET_ASSOC{icache_data_wdata_enc}}),
++      .be_i   (data_sram_be),
++      .ruser_o(data_sram_ruser),
++      .rdata_o(data_sram_rdata)
++  );
++// end of DATA CACHE
++
++endmodule
+diff --git a/corev_apu/src/ariane.sv b/corev_apu/src/ariane.sv
+index 38b3281b..2e21501c 100644
+--- a/corev_apu/src/ariane.sv
++++ b/corev_apu/src/ariane.sv
+@@ -13,7 +13,9 @@
+ // Description: Ariane Top-level module
+ 
+ 
+-module ariane import ariane_pkg::*; #(
++module ariane import ariane_pkg::*; 
++  import neurosoc_cache_pkg::*;
++#(
+   parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
+   parameter type rvfi_probes_instr_t = logic,
+   parameter type rvfi_probes_csr_t = logic,
+@@ -47,8 +49,13 @@ module ariane import ariane_pkg::*; #(
+   output rvfi_probes_t rvfi_probes_o,
+   // memory side
+   output noc_req_t                     noc_req_o,
+-  input  noc_resp_t                    noc_resp_i
+-);
++  input  noc_resp_t                    noc_resp_i,
++    // sram macroports
++  output dcache_ext_req_t dcache_req,
++  input  dcache_ext_resp_t dcache_resp,
++    output icache_ext_req_t  icache_req,
++    input  icache_ext_resp_t icache_resp
++  );
+ 
+   cvxif_pkg::cvxif_req_t  cvxif_req;
+   cvxif_pkg::cvxif_resp_t cvxif_resp;
+@@ -76,7 +83,12 @@ module ariane import ariane_pkg::*; #(
+     .cvxif_req_o          ( cvxif_req                 ),
+     .cvxif_resp_i         ( cvxif_resp                ),
+     .noc_req_o            ( noc_req_o                 ),
+-    .noc_resp_i           ( noc_resp_i                )
++    .noc_resp_i           ( noc_resp_i                ),
++      // sram macroports
++    .dcache_req(dcache_req),
++    .dcache_resp(dcache_resp),
++    .icache_req(icache_req),
++    .icache_resp(icache_resp)
+   );
+ 
+   if (CVA6Cfg.CvxifEn) begin : gen_example_coprocessor
+-- 
+2.50.1
+
