@@ -1,0 +1,13 @@
+diff --git a/rtl/src/hpdcache_pkg.sv b/rtl/src/hpdcache_pkg.sv
+index 677b07e..d0d9ead 100755
+--- a/rtl/src/hpdcache_pkg.sv
++++ b/rtl/src/hpdcache_pkg.sv
+@@ -79,7 +79,7 @@ package hpdcache_pkg;
+         HPDCACHE_VICTIM_PLRU   = 1
+     } hpdcache_victim_sel_policy_t;
+ 
+-    localparam int unsigned HPDCACHE_VICTIM_SEL = hpdcache_params_pkg::PARAM_VICTIM_SEL;
++    localparam hpdcache_victim_sel_policy_t HPDCACHE_VICTIM_SEL = hpdcache_params_pkg::PARAM_VICTIM_SEL;
+ 
+     typedef logic unsigned [  HPDCACHE_OFFSET_WIDTH-1:0] hpdcache_offset_t;
+     typedef logic unsigned [   HPDCACHE_NLINE_WIDTH-1:0] hpdcache_nline_t;

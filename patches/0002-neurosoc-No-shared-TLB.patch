@@ -1,0 +1,338 @@
+From c5b4e7a14395d1073de8a4c7651d0ab82e13502f Mon Sep 17 00:00:00 2001
+From: Abdou Lahat NDIAYE <abdou-lahat.ndiaye@thalesgroup.com>
+Date: Mon, 3 Feb 2025 10:20:26 +0100
+Subject: [PATCH 2/3] [neurosoc] No shared TLB
+
+---
+ core/include/ariane_pkg.sv                  |   4 +-
+ core/include/build_config_pkg.sv            |   5 +-
+ core/include/config_pkg.sv                  |  12 ++
+ core/include/cv32a6_imac_sv32_config_pkg.sv |  20 +--
+ core/load_store_unit.sv                     |   8 +-
+ core/mmu_sv32/cva6_mmu_sv32.sv              |   8 +-
+ core/mmu_sv32/cva6_shared_tlb_sv32.sv       | 128 ++++++++++++--------
+ 7 files changed, 111 insertions(+), 74 deletions(-)
+
+diff --git a/core/include/ariane_pkg.sv b/core/include/ariane_pkg.sv
+index 792c117c..509bdd93 100644
+--- a/core/include/ariane_pkg.sv
++++ b/core/include/ariane_pkg.sv
+@@ -543,8 +543,8 @@ package ariane_pkg;
+   // ---------------
+   localparam bit MMU_PRESENT = cva6_config_pkg::CVA6ConfigMmuPresent;
+ 
+-  localparam int unsigned INSTR_TLB_ENTRIES = cva6_config_pkg::CVA6ConfigInstrTlbEntries;
+-  localparam int unsigned DATA_TLB_ENTRIES = cva6_config_pkg::CVA6ConfigDataTlbEntries;
++  //localparam int unsigned INSTR_TLB_ENTRIES = cva6_config_pkg::CVA6ConfigInstrTlbEntries;
++  //localparam int unsigned DATA_TLB_ENTRIES = cva6_config_pkg::CVA6ConfigDataTlbEntries;
+ 
+   // -------------------
+   // Performance counter
+diff --git a/core/include/build_config_pkg.sv b/core/include/build_config_pkg.sv
+index 5328debf..fb9df090 100644
+--- a/core/include/build_config_pkg.sv
++++ b/core/include/build_config_pkg.sv
+@@ -134,7 +134,10 @@ package build_config_pkg;
+     cfg.PPNW = (CVA6Cfg.XLEN == 32) ? 22 : 44;
+     cfg.MODE_SV = (CVA6Cfg.XLEN == 32) ? config_pkg::ModeSv32 : config_pkg::ModeSv39;
+     cfg.SV = (cfg.MODE_SV == config_pkg::ModeSv32) ? 32 : 39;
+-
++    cfg.InstrTlbEntries = CVA6Cfg.InstrTlbEntries;
++    cfg.DataTlbEntries = CVA6Cfg.DataTlbEntries;
++    cfg.UseSharedTlb = CVA6Cfg.UseSharedTlb;
++    cfg.SharedTlbDepth = CVA6Cfg.SharedTlbDepth;
+     return cfg;
+   endfunction
+ 
+diff --git a/core/include/config_pkg.sv b/core/include/config_pkg.sv
+index 9ed4dc80..85cb316b 100644
+--- a/core/include/config_pkg.sv
++++ b/core/include/config_pkg.sv
+@@ -162,6 +162,14 @@ package config_pkg;
+     int unsigned                 FetchUserWidth;
+     // TODO
+     int unsigned                 FetchUserEn;
++    // MMU instruction TLB entries
++    int unsigned                 InstrTlbEntries;
++    // MMU data TLB entries
++    int unsigned                 DataTlbEntries;
++    // MMU option to use shared TLB
++    bit unsigned                 UseSharedTlb;
++    // MMU depth of shared TLB
++    int unsigned                 SharedTlbDepth;
+   } cva6_user_cfg_t;
+ 
+   typedef struct packed {
+@@ -276,6 +284,10 @@ package config_pkg;
+     int unsigned PPNW;
+     vm_mode_t MODE_SV;
+     int unsigned SV;
++    int unsigned InstrTlbEntries;
++    int unsigned DataTlbEntries;
++    bit unsigned UseSharedTlb;
++    int unsigned SharedTlbDepth;
+   } cva6_cfg_t;
+ 
+   /// Empty configuration to sanity check proper parameter passing. Whenever
+diff --git a/core/include/cv32a6_imac_sv32_config_pkg.sv b/core/include/cv32a6_imac_sv32_config_pkg.sv
+index daf87fd1..0f9cc75f 100644
+--- a/core/include/cv32a6_imac_sv32_config_pkg.sv
++++ b/core/include/cv32a6_imac_sv32_config_pkg.sv
+@@ -35,11 +35,11 @@ package cva6_config_pkg;
+   localparam CVA6ConfigDataUserEn = 0;
+   localparam CVA6ConfigDataUserWidth = CVA6ConfigXlen;
+ 
+-  localparam CVA6ConfigIcacheByteSize = 16384;
+-  localparam CVA6ConfigIcacheSetAssoc = 4;
++  localparam CVA6ConfigIcacheByteSize = 8192;
++  localparam CVA6ConfigIcacheSetAssoc = 2;
+   localparam CVA6ConfigIcacheLineWidth = 128;
+-  localparam CVA6ConfigDcacheByteSize = 32768;
+-  localparam CVA6ConfigDcacheSetAssoc = 8;
++  localparam CVA6ConfigDcacheByteSize = 8192;
++  localparam CVA6ConfigDcacheSetAssoc = 2;
+   localparam CVA6ConfigDcacheLineWidth = 128;
+ 
+   localparam CVA6ConfigDcacheIdWidth = 1;
+@@ -47,7 +47,7 @@ package cva6_config_pkg;
+ 
+   localparam CVA6ConfigWtDcacheWbufDepth = 8;
+ 
+-  localparam CVA6ConfigNrCommitPorts = 2;
++  localparam CVA6ConfigNrCommitPorts = 1;//2;
+   localparam CVA6ConfigNrScoreboardEntries = 8;
+ 
+   localparam CVA6ConfigFPGAEn = 0;
+@@ -56,8 +56,8 @@ package cva6_config_pkg;
+   localparam CVA6ConfigNrStorePipeRegs = 0;
+   localparam CVA6ConfigNrLoadBufEntries = 2;
+ 
+-  localparam CVA6ConfigInstrTlbEntries = 2;
+-  localparam CVA6ConfigDataTlbEntries = 2;
++  //localparam CVA6ConfigInstrTlbEntries = 16;
++  //localparam CVA6ConfigDataTlbEntries = 16;
+ 
+   localparam CVA6ConfigRASDepth = 2;
+   localparam CVA6ConfigBTBEntries = 32;
+@@ -145,7 +145,11 @@ package cva6_config_pkg;
+       DcacheLineWidth: unsigned'(CVA6ConfigDcacheLineWidth),
+       DataUserEn: unsigned'(CVA6ConfigDataUserEn),
+       FetchUserWidth: unsigned'(CVA6ConfigFetchUserWidth),
+-      FetchUserEn: unsigned'(CVA6ConfigFetchUserEn)
++      FetchUserEn: unsigned'(CVA6ConfigFetchUserEn),
++      InstrTlbEntries: int'(16),
++      DataTlbEntries: int'(16),
++      UseSharedTlb: bit'(0),
++      SharedTlbDepth: int'(64)
+   };
+ 
+ endpackage
+diff --git a/core/load_store_unit.sv b/core/load_store_unit.sv
+index c5051f94..1af71931 100644
+--- a/core/load_store_unit.sv
++++ b/core/load_store_unit.sv
+@@ -193,9 +193,7 @@ module load_store_unit
+         .icache_dreq_t    (icache_dreq_t),
+         .icache_drsp_t    (icache_drsp_t),
+         .dcache_req_i_t   (dcache_req_i_t),
+-        .dcache_req_o_t   (dcache_req_o_t),
+-        .INSTR_TLB_ENTRIES(ariane_pkg::INSTR_TLB_ENTRIES),
+-        .DATA_TLB_ENTRIES (ariane_pkg::DATA_TLB_ENTRIES)
++        .dcache_req_o_t   (dcache_req_o_t)
+     ) i_cva6_mmu (
+         // misaligned bypass
+         .misaligned_ex_i(misaligned_exception),
+@@ -228,9 +226,7 @@ module load_store_unit
+         .icache_dreq_t    (icache_dreq_t),
+         .icache_drsp_t    (icache_drsp_t),
+         .dcache_req_i_t   (dcache_req_i_t),
+-        .dcache_req_o_t   (dcache_req_o_t),
+-        .INSTR_TLB_ENTRIES(ariane_pkg::INSTR_TLB_ENTRIES),
+-        .DATA_TLB_ENTRIES (ariane_pkg::DATA_TLB_ENTRIES)
++        .dcache_req_o_t   (dcache_req_o_t)
+     ) i_cva6_mmu (
+         // misaligned bypass
+         .misaligned_ex_i(misaligned_exception),
+diff --git a/core/mmu_sv32/cva6_mmu_sv32.sv b/core/mmu_sv32/cva6_mmu_sv32.sv
+index 6daf56fb..d40eeed9 100644
+--- a/core/mmu_sv32/cva6_mmu_sv32.sv
++++ b/core/mmu_sv32/cva6_mmu_sv32.sv
+@@ -36,9 +36,7 @@ module cva6_mmu_sv32
+     parameter type                   icache_dreq_t     = logic,
+     parameter type                   icache_drsp_t     = logic,
+     parameter type                   dcache_req_i_t    = logic,
+-    parameter type                   dcache_req_o_t    = logic,
+-    parameter int unsigned           INSTR_TLB_ENTRIES = 2,
+-    parameter int unsigned           DATA_TLB_ENTRIES  = 2
++    parameter type                   dcache_req_o_t    = logic
+ ) (
+     input logic clk_i,
+     input logic rst_ni,
+@@ -120,7 +118,7 @@ module cva6_mmu_sv32
+ 
+   cva6_tlb_sv32 #(
+       .CVA6Cfg    (CVA6Cfg),
+-      .TLB_ENTRIES(INSTR_TLB_ENTRIES)
++      .TLB_ENTRIES(CVA6Cfg.InstrTlbEntries)
+   ) i_itlb (
+       .clk_i  (clk_i),
+       .rst_ni (rst_ni),
+@@ -141,7 +139,7 @@ module cva6_mmu_sv32
+ 
+   cva6_tlb_sv32 #(
+       .CVA6Cfg    (CVA6Cfg),
+-      .TLB_ENTRIES(DATA_TLB_ENTRIES)
++      .TLB_ENTRIES(CVA6Cfg.DataTlbEntries)
+   ) i_dtlb (
+       .clk_i  (clk_i),
+       .rst_ni (rst_ni),
+diff --git a/core/mmu_sv32/cva6_shared_tlb_sv32.sv b/core/mmu_sv32/cva6_shared_tlb_sv32.sv
+index d72dc4a6..47892db7 100644
+--- a/core/mmu_sv32/cva6_shared_tlb_sv32.sv
++++ b/core/mmu_sv32/cva6_shared_tlb_sv32.sv
+@@ -204,23 +204,45 @@ module cva6_shared_tlb_sv32
+     shared_tlb_hit_d = 1'b0;
+     dtlb_update_o = '0;
+     itlb_update_o = '0;
++
++    if (!CVA6Cfg.UseSharedTlb) begin
++      if (shared_tlb_update_i.valid) begin
++        shared_tlb_hit_d = 1'b1;
++        if (itlb_req_q) begin
++          itlb_update_o.valid = 1'b1;
++          itlb_update_o.vpn = shared_tlb_update_i.vpn;
++          itlb_update_o.is_4M = shared_tlb_update_i.is_4M;
++          itlb_update_o.content = shared_tlb_update_i.content;
++          itlb_update_o.asid = shared_tlb_update_i.asid;
++
++        end else if (dtlb_req_q) begin
++          dtlb_update_o.valid = 1'b1;
++          dtlb_update_o.vpn = shared_tlb_update_i.vpn;
++          dtlb_update_o.is_4M = shared_tlb_update_i.is_4M;
++          dtlb_update_o.content = shared_tlb_update_i.content;
++          dtlb_update_o.asid = shared_tlb_update_i.asid;
++        end
++      end
++    end else begin
++
+     //number of ways
+-    for (int unsigned i = 0; i < SHARED_TLB_WAYS; i++) begin
+-      if (shared_tag_valid[i] && ((tlb_update_asid_q == shared_tag_rd[i].asid) || pte[i].g)  && vpn1_q == shared_tag_rd[i].vpn1) begin
+-        if (shared_tag_rd[i].is_4M || vpn0_q == shared_tag_rd[i].vpn0) begin
+-          shared_tlb_hit_d = 1'b1;
+-          if (itlb_req_q) begin
+-            itlb_update_o.valid = 1'b1;
+-            itlb_update_o.vpn = itlb_vpn_q;
+-            itlb_update_o.is_4M = shared_tag_rd[i].is_4M;
+-            itlb_update_o.asid = tlb_update_asid_q;
+-            itlb_update_o.content = pte[i];
+-          end else if (dtlb_req_q) begin
+-            dtlb_update_o.valid = 1'b1;
+-            dtlb_update_o.vpn = dtlb_vpn_q;
+-            dtlb_update_o.is_4M = shared_tag_rd[i].is_4M;
+-            dtlb_update_o.asid = tlb_update_asid_q;
+-            dtlb_update_o.content = pte[i];
++      for (int unsigned i = 0; i < SHARED_TLB_WAYS; i++) begin
++        if (shared_tag_valid[i] && ((tlb_update_asid_q == shared_tag_rd[i].asid) || pte[i].g)  && vpn1_q == shared_tag_rd[i].vpn1) begin
++          if (shared_tag_rd[i].is_4M || vpn0_q == shared_tag_rd[i].vpn0) begin
++            shared_tlb_hit_d = 1'b1;
++            if (itlb_req_q) begin
++              itlb_update_o.valid = 1'b1;
++              itlb_update_o.vpn = itlb_vpn_q;
++              itlb_update_o.is_4M = shared_tag_rd[i].is_4M;
++              itlb_update_o.asid = tlb_update_asid_q;
++              itlb_update_o.content = pte[i];
++            end else if (dtlb_req_q) begin
++              dtlb_update_o.valid = 1'b1;
++              dtlb_update_o.vpn = dtlb_vpn_q;
++              dtlb_update_o.is_4M = shared_tag_rd[i].is_4M;
++              dtlb_update_o.asid = tlb_update_asid_q;
++              dtlb_update_o.content = pte[i];
++            end
+           end
+         end
+       end
+@@ -324,42 +346,44 @@ module cva6_shared_tlb_sv32
+   assign pte_addr = pte_wr_en ? pte_wr_addr : pte_rd_addr;
+ 
+   for (genvar i = 0; i < SHARED_TLB_WAYS; i++) begin : gen_sram
+-    // Tag RAM
+-    sram #(
+-        .DATA_WIDTH($bits(shared_tag_t)),
+-        .NUM_WORDS (SHARED_TLB_DEPTH)
+-    ) tag_sram (
+-        .clk_i  (clk_i),
+-        .rst_ni (rst_ni),
+-        .req_i  (tag_req[i]),
+-        .we_i   (tag_we[i]),
+-        .addr_i (tag_addr),
+-        .wuser_i('0),
+-        .wdata_i(tag_wr_data),
+-        .be_i   ('1),
+-        .ruser_o(),
+-        .rdata_o(tag_rd_data[i])
+-    );
+-
+-    assign shared_tag_rd[i] = shared_tag_t'(tag_rd_data[i]);
+-
+-    // PTE RAM
+-    sram #(
+-        .DATA_WIDTH($bits(riscv::pte_sv32_t)),
+-        .NUM_WORDS (SHARED_TLB_DEPTH)
+-    ) pte_sram (
+-        .clk_i  (clk_i),
+-        .rst_ni (rst_ni),
+-        .req_i  (pte_req[i]),
+-        .we_i   (pte_we[i]),
+-        .addr_i (pte_addr),
+-        .wuser_i('0),
+-        .wdata_i(pte_wr_data),
+-        .be_i   ('1),
+-        .ruser_o(),
+-        .rdata_o(pte_rd_data[i])
+-    );
+-    assign pte[i] = riscv::pte_sv32_t'(pte_rd_data[i]);
++    if (CVA6Cfg.UseSharedTlb) begin
++      // Tag RAM
++      sram #(
++          .DATA_WIDTH($bits(shared_tag_t)),
++          .NUM_WORDS (SHARED_TLB_DEPTH)
++      ) tag_sram (
++          .clk_i  (clk_i),
++          .rst_ni (rst_ni),
++          .req_i  (tag_req[i]),
++          .we_i   (tag_we[i]),
++          .addr_i (tag_addr),
++          .wuser_i('0),
++          .wdata_i(tag_wr_data),
++          .be_i   ('1),
++          .ruser_o(),
++          .rdata_o(tag_rd_data[i])
++      );
++
++      assign shared_tag_rd[i] = shared_tag_t'(tag_rd_data[i]);
++
++      // PTE RAM
++      sram #(
++          .DATA_WIDTH($bits(riscv::pte_sv32_t)),
++          .NUM_WORDS (SHARED_TLB_DEPTH)
++      ) pte_sram (
++          .clk_i  (clk_i),
++          .rst_ni (rst_ni),
++          .req_i  (pte_req[i]),
++          .we_i   (pte_we[i]),
++          .addr_i (pte_addr),
++          .wuser_i('0),
++          .wdata_i(pte_wr_data),
++          .be_i   ('1),
++          .ruser_o(),
++          .rdata_o(pte_rd_data[i])
++      );
++      assign pte[i] = riscv::pte_sv32_t'(pte_rd_data[i]);
++    end
+   end
+ endmodule
+ 
+-- 
+2.50.1
+
